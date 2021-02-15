@@ -1,6 +1,6 @@
 import sys
 sys.path.insert(0, './yolov5')
-
+import math
 from yolov5.utils.datasets import LoadImages, LoadStreams
 from yolov5.utils.general import check_img_size, non_max_suppression, scale_coords
 from yolov5.utils.torch_utils import select_device, time_synchronized
@@ -20,7 +20,9 @@ import torch.backends.cudnn as cudnn
 
 palette = (2 ** 11 - 1, 2 ** 15 - 1, 2 ** 20 - 1)
 
-
+track = {}
+cli =0
+global track_modes
 def bbox_rel(*xyxy):
     """" Calculates the relative bounding box from absolute pixel values. """
     bbox_left = min([xyxy[0].item(), xyxy[2].item()])
@@ -41,8 +43,12 @@ def compute_color_for_labels(label):
     color = [int((p * (label ** 2 - label + 1)) % 255) for p in palette]
     return tuple(color)
 
-
-def draw_boxes(img, bbox, identities=None, offset=(0, 0)):
+def draw_boxes(img, bbox, identities=None, track_modes=None, cli=0,offset=(0, 0)):
+    if (track_modes == False):
+        for i in range(1, 100):
+            if ((track[i] >= 100) & (track_modes == False)):
+                track_modes = True
+                cli = i
     for i, box in enumerate(bbox):
         x1, y1, x2, y2 = [int(i) for i in box]
         x1 += offset[0]
@@ -57,9 +63,28 @@ def draw_boxes(img, bbox, identities=None, offset=(0, 0)):
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
         cv2.rectangle(
             img, (x1, y1), (x1 + t_size[0] + 3, y1 + t_size[1] + 4), color, -1)
-        cv2.putText(img, label, (x1, y1 +
+        if(track_modes==False):
+            track[id] = track[id] + 1
+            cv2.putText(img, label, (x1, y1 +
                                  t_size[1] + 4), cv2.FONT_HERSHEY_PLAIN, 2, [255, 255, 255], 2)
+
+            cv2.putText(img, "Tracking Client...", (400,50), cv2.FONT_HERSHEY_SIMPLEX, 2,  [0, 0, 0], 10)
+
+        else:
+            cv2.putText(img, "Client Detected! Following...", (400,50), cv2.FONT_HERSHEY_SIMPLEX, 2, [0, 0, 0], 10)
+            if(id == cli):
+                cv2.rectangle(img, (x1, y1), (x2, y2), (0,0,255), 6)
+                cv2.rectangle(
+                    img, (x1, y1), (x1 + t_size[0] + 100, y1 + t_size[1] + 8),  (0,0,255), -1)
+                cv2.putText(img, "CLIENT", (x1, y1 +
+                                     t_size[1] + 4), cv2.FONT_HERSHEY_PLAIN, 2, [255, 255, 255], 2)
+                cv2.ellipse(img,(1000, 1000),(300,300), 0,180, 360,(255,255,255),-1)
+                cv2.arrowedLine(img, (1000, 1000), (int((x1 + x2) / 2), int((y1 + y2) / 2)), (0, 0, 255), 10, 8, 0, 0.1)
+            else:
+                cv2.putText(img, label, (x1, y1 +
+                                         t_size[1] + 4), cv2.FONT_HERSHEY_PLAIN, 2, (255,255,255), 2)
     return img
+
 
 
 def detect(opt, save_img=False):
@@ -170,7 +195,7 @@ def detect(opt, save_img=False):
                 if len(outputs) > 0:
                     bbox_xyxy = outputs[:, :4]
                     identities = outputs[:, -1]
-                    draw_boxes(im0, bbox_xyxy, identities)
+                    draw_boxes(im0, bbox_xyxy, identities, track_modes, cli)
 
                 # Write MOT compliant results to file
                 if save_txt and len(outputs) != 0:
@@ -259,5 +284,9 @@ if __name__ == '__main__':
     args.img_size = check_img_size(args.img_size)
     print(args)
 
+    for i in range(1, 100):
+        track[i]=0
+    cli = 0;
+    track_modes = False;
     with torch.no_grad():
         detect(args)
