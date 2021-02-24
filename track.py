@@ -1,13 +1,11 @@
 import sys
 sys.path.insert(0, './yolov5')
-import math
 from yolov5.utils.datasets import LoadImages, LoadStreams
 from yolov5.utils.general import check_img_size, non_max_suppression, scale_coords
 from yolov5.utils.torch_utils import select_device, time_synchronized
 from deep_sort_pytorch.utils.parser import get_config
 from deep_sort_pytorch.deep_sort import DeepSort
 import argparse
-import os
 import platform
 import shutil
 import time
@@ -16,15 +14,143 @@ import cv2
 import torch
 import torch.backends.cudnn as cudnn
 import numpy as np
+from concurrent.futures import ProcessPoolExecutor
+import threading
+from threading import Thread
+import os
+from queue import Queue
+import sys
+import matplotlib.mlab as mlab
+import pyaudio
+from keras.models import load_model
 
-
+os.environ['KMP_DUPLICATE_LIB_OK']='True'
 palette = (2 ** 11 - 1, 2 ** 15 - 1, 2 ** 20 - 1)
 
-global track_modes
-global cli
-global height, width
+global track_modes, cli, height, width, cli_time, keyword, que,t
+
+keyword=""
 track = {}
 cli =0
+cli_time=0
+
+
+data_c = None
+# Use 1101 for 2sec input audio
+Tx = 5511 # The number of time steps input to the model from the spectrogram
+n_freq = 101 # Number of frequencies input to the model at each time step of the spectrogram
+
+# Use 272 for 2sec input audio
+Ty = 1375# The number of time steps in the output of our model
+
+model = load_model('./keyword_spotting/tr_model_t.h5')
+
+def detect_triggerword_spectrum(x):
+    x  = x.swapaxes(0,1)
+    x = np.expand_dims(x, axis=0)
+    predictions = model.predict(x)
+    return predictions.reshape(-1)
+
+def has_new_triggerword(predictions, chunk_duration, feed_duration, threshold=0.5):
+    predictions = predictions > threshold
+    chunk_predictions_samples = int(len(predictions) * chunk_duration / feed_duration)
+    chunk_predictions = predictions[-chunk_predictions_samples:]
+    level = chunk_predictions[0]
+    for pred in chunk_predictions:
+        if pred > level:
+            return True
+        else:
+            level = pred
+    return False
+
+"""# Record audio stream from mic"""
+chunk_duration = 0.5 # Each read length in seconds from mic.
+fs = 44100 # sampling rate for mic
+chunk_samples = int(fs * chunk_duration) # Each read length in number of samples.
+
+# Each model input data duration in seconds, need to be an integer numbers of chunk_duration
+feed_duration = 10
+feed_samples = int(fs * feed_duration)
+
+assert feed_duration/chunk_duration == int(feed_duration/chunk_duration)
+def get_spectrogram(data):
+    nfft = 200 # Length of each window segment
+    fs = 8000 # Sampling frequencies
+    noverlap = 120 # Overlap between windows
+    nchannels = data.ndim
+    if nchannels == 1:
+        pxx, _, _ = mlab.specgram(data, nfft, fs, noverlap = noverlap)
+    elif nchannels == 2:
+        pxx, _, _ = mlab.specgram(data[:,0], nfft, fs, noverlap = noverlap)
+    return pxx
+
+"""### Audio stream"""
+
+def get_audio_input_stream(callback):
+    stream = pyaudio.PyAudio().open(
+        format=pyaudio.paInt16,
+        channels=1,
+        rate=fs,
+        input=True,
+        frames_per_buffer=chunk_samples,
+        input_device_index=0,
+        stream_callback=callback)
+    return stream
+
+# Queue to communiate between the audio callback and main thread
+q = Queue()
+que = Queue()
+run = True
+silence_threshold = 100
+timeout = 2*60  # 0.1 minutes from now
+# Data buffer for the input wavform
+data = np.zeros(feed_samples, dtype='int16')
+
+def callback(in_data, frame_count, time_info, status):
+    global run, timeout, data, silence_threshold
+    if time.time() > timeout:
+        run = False
+    data0 = np.frombuffer(in_data, dtype='int16')
+    if np.abs(data0).mean() < silence_threshold:
+        sys.stdout.write('------------dddd-----')
+        return (in_data, pyaudio.paContinue)
+    else:
+        sys.stdout.write('.............dddd....')
+    data = np.append(data,data0)
+    if len(data) > feed_samples:
+        data = data[-feed_samples:]
+        # Process data async by sending a queue.
+        q.put(data)
+    return (in_data, pyaudio.paContinue)
+
+def check_where():
+    stream = get_audio_input_stream(callback)
+    stream.start_stream()
+    count=0
+    global run, timeout,s
+    try:
+        while count<timeout:
+            data = q.get()
+            spectrum = get_spectrogram(data)
+            preds = detect_triggerword_spectrum(spectrum)
+            new_trigger = has_new_triggerword(preds, chunk_duration, feed_duration)
+            if new_trigger:
+                print('I CAN HEAR TRIGGER##################')
+                que.put('RESTART TRACKING')
+            else:
+                print('I CAN HEAR NOTHING$$$$$$$$$$$$$$$$$$')
+                que.put('HEAR NOTHING')
+            #time.sleep(1)
+            count = count+1
+    except (KeyboardInterrupt, SystemExit):
+        stream.stop_stream()
+        stream.close()
+        timeout = time.time()
+        run = False
+    stream.stop_stream()
+    stream.close()
+
+
 def bbox_rel(*xyxy):
     """" Calculates the relative bounding box from absolute pixel values. """
     bbox_left = min([xyxy[0].item(), xyxy[2].item()])
@@ -44,15 +170,75 @@ def compute_color_for_labels(label):
     color = [int((p * (label ** 2 - label + 1)) % 255) for p in palette]
     return tuple(color)
 
+#class mapping-> 객체 받는식
+
+def draw_boxes_after_no(img, bbox, identities=None, offset=(0,0)):
+    global cli_time,track_modes, track, cli,t
+    cli_time += 1
+    if (cli_time < 20):
+        if (cli in identities):
+            track_modes=2
+            return draw_boxes_after_yes(img, bbox, identities, offset)
+        else:
+            return draw_boxes_after_yes(img, bbox, identities, offset)
+    if (cli_time == 20):
+        t = threading.Thread(target=check_where)
+        t.start()
+        # t.join()
+        cv2.putText(img, "Client Missing! Listening...", (int(width / 5), int(height / 9)),cv2.FONT_HERSHEY_SIMPLEX, 3, [0, 0, 0], 10)
+        return draw_boxes_plain(img, bbox,identities, offset)
+    if (cli_time > 20 and cli_time <110):
+        cv2.putText(img, "Listening the word...", (int(width / 5), int(height / 9)),cv2.FONT_HERSHEY_SIMPLEX, 3, [0, 0, 0], 10)
+        string = que.get()
+        if(string is 'RESTART TRACKING'):
+            track_modes = 1
+#            cli = 0
+#            for i in range(1, 100):
+#                track[i] = 0
+            cv2.putText(img, 'RESTART TRACKING ', (int(width / 3), int(height / 4)), cv2.FONT_HERSHEY_SIMPLEX, 3, [0, 0, 0], 10)
+            return draw_boxes_before(img, bbox, identities, offset)
+        else:
+            cv2.putText(img,'HEAR NOTHING ', (int(width/3), int(height / 4)),cv2.FONT_HERSHEY_SIMPLEX, 3, [0, 0, 0], 10)
+            return draw_boxes_plain(img, bbox, identities, offset)
+    if (cli_time >= 110):
+        track_modes =1
+        cli=0
+        for i in range(1, 100):
+            track[i] = 0
+        return draw_boxes_before(img, bbox, identities, offset)
+    return img
+
+
+def draw_boxes_plain(img, bbox, identities=None, offset=(0,0)):
+    for i, box in enumerate(bbox):
+        x1, y1, x2, y2 = [int(i) for i in box]
+        x1 += offset[0]
+        x2 += offset[0]
+        y1 += offset[1]
+        y2 += offset[1]
+        # box text and bar
+        id = int(identities[i]) if identities is not None else 0
+        color = compute_color_for_labels(id)
+        label = '{}{:d}'.format("", id)
+        t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_PLAIN, 2, 2)[0]
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
+        cv2.rectangle(img, (x1, y1), (x1 + t_size[0] + 3, y1 + t_size[1] + 4), color, -1)
+        track[id] = track[id] + 1
+        cv2.putText(img, label, (x1, y1 + t_size[1] + 4), cv2.FONT_HERSHEY_PLAIN, 2, [255, 255, 255], 2)
+    return img
+
+
 def draw_boxes_before(img, bbox, identities=None, offset=(0,0)):
-    cv2.putText(img, "Tracking Client...", (int(width/3), int(height/9)), cv2.FONT_HERSHEY_SIMPLEX, 3, [0, 0, 0], 10)
+    global track_modes, cli, track
+    if(track_modes==1):
+        cv2.putText(img, "Tracking Client...", (int(width/3), int(height/9)), cv2.FONT_HERSHEY_SIMPLEX, 3, [0, 0, 0], 10)
+    if(track_modes==3):
+        cv2.putText(img, "Client Missing! Start Finding", (int(width / 5), int(height / 9)),cv2.FONT_HERSHEY_SIMPLEX, 3, [0, 0, 0], 10)
     for i in range(1, 100):
-        if (track[i] >= 100):
-            global track_modes
-            track_modes = True
-            global cli
+        if (track[i] >= 20):
+            track_modes = 2
             cli = i
-    print("Finding Client client is " + str(cli));
+    print("Finding Client client is " + str(cli))
     for i, box in enumerate(bbox):
         x1, y1, x2, y2 = [int(i) for i in box]
         x1 += offset[0]
@@ -71,7 +257,22 @@ def draw_boxes_before(img, bbox, identities=None, offset=(0,0)):
     return img
 
 def draw_boxes_after(img, bbox, identities=None, offset=(0,0)):
-    cv2.putText(img, "Client Detected! Following...",  (int(width/5), int(height/9)), cv2.FONT_HERSHEY_SIMPLEX, 3, [0, 0, 0], 10)
+    global cli_time, track_modes
+    if(cli in identities):  # detect 잘되면
+        cli_time=0
+        track_modes=2
+        return draw_boxes_after_yes(img, bbox, identities, offset)
+    else:                   # detect 안되
+        track_modes=3
+        return draw_boxes_after_no(img, bbox, identities, offset)
+
+def draw_boxes_after_yes(img, bbox, identities=None, offset=(0,0)):
+    global cli_time, track_modes
+    if(track_modes==2):
+        cli_time=0
+        cv2.putText(img, "Client Detected! Following...",  (int(width/5), int(height/9)), cv2.FONT_HERSHEY_SIMPLEX, 3, [0, 0, 0], 10)
+    if(track_modes==3):
+        cv2.putText(img, "Client Missing! Start Finding " + str(cli_time), (int(width / 5), int(height / 9)),cv2.FONT_HERSHEY_SIMPLEX, 3, [0, 0, 0], 10)
     for i, box in enumerate(bbox):
         x1, y1, x2, y2 = [int(i) for i in box]
         x1 += offset[0]
@@ -210,10 +411,12 @@ def detect(opt, save_img=False):
                     bbox_xyxy = outputs[:, :4]
                     identities = outputs[:, -1]
                     global track_modes
-                    if(track_modes==False):
+                    if(track_modes==1):
                         draw_boxes_before(im0, bbox_xyxy, identities)
-                    else:
+                    if (track_modes==2):
                         draw_boxes_after(im0, bbox_xyxy, identities)
+                    if (track_modes==3):
+                        draw_boxes_after_no(im0, bbox_xyxy, identities)
 
                 # Write MOT compliant results to file
                 if save_txt and len(outputs) != 0:
@@ -304,10 +507,10 @@ if __name__ == '__main__':
     args = parser.parse_args()
     args.img_size = check_img_size(args.img_size)
     print(args)
-
+    pool = ProcessPoolExecutor(2)
     for i in range(1, 100):
         track[i]=0
     cli = 0;
-    track_modes= False;
+    track_modes= 1
     with torch.no_grad():
         detect(args)
