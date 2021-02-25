@@ -8,8 +8,8 @@ Our algorithm has 2 Deep Learning Models.
 
 ### Description
 
-The implementation is based on two papers:
-
+The implementation is based on two papers & Github Repository:
+- Object Tracking(https://github.com/mikel-brostrom/Yolov5_DeepSort_Pytorch)
 - Simple Online and Realtime Tracking with a Deep Association Metric
 https://arxiv.org/abs/1703.07402
 - YOLOv4: Optimal Speed and Accuracy of Object Detection
